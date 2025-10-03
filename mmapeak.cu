@@ -1,11 +1,16 @@
-// nvcc -O2 mmapeak.cu -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120a,code=sm_120a -o mmapeak
+// nvcc -O2 mmapeak.cu -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_110f,code=sm_110 -gencode arch=compute_120f,code=sm_120 -o mmapeak
 
 #include <cuda.h>
 #include <mma.h>
 #if __CUDA_ARCH__ >= 890
 #include <cuda_fp8.h>
 #endif
-#if __CUDA_ARCH__ >= 1200 && !(__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 8 && __CUDACC_VER_BUILD__ < 90))
+// Consumer Blackwell (>= SM120) only
+// TODO: Support SM100 and SM110
+#if __CUDA_ARCH__ >= 1200 && \
+    !(__CUDACC_VER_MAJOR__ < 12 || \
+        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8) || \
+        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 8 && __CUDACC_VER_BUILD__ < 90))
 #define ENABLE_BLACKWELL 1
 #endif
 #if ENABLE_BLACKWELL
