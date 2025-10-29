@@ -13,9 +13,9 @@
     !(__CUDACC_VER_MAJOR__ < 12 || \
         (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8) || \
         (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 8 && __CUDACC_VER_BUILD__ < 90))
-#define ENABLE_TCG05_FP4 1
+#define ENABLE_BLACKWELL 1
 #endif
-#if ENABLE_TCG05_FP4
+#if ENABLE_BLACKWELL
 #include <cuda_fp4.h>
 #endif
 #include <stdio.h>
