@@ -5,15 +5,17 @@
 #if __CUDA_ARCH__ >= 890
 #include <cuda_fp8.h>
 #endif
-// Consumer Blackwell (>= SM120) only
-// TODO: Support SM100 and SM110
-#if __CUDA_ARCH__ >= 1200 && \
+// Blackwell / tcgen05 FP4/FP6 MMA are available on SM100+ with CUDA >= 12.8.90
+// (PTX 8.7+) and in CUDA 12.9/13.0 (PTX 9.0). See PTX ISA doc examples for
+// kind::mxf4 and kind::mxf4nvf4 mma.sync.aligned forms.
+// Enable when compiling for any SM >= 100 (B200/B100 etc).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
     !(__CUDACC_VER_MAJOR__ < 12 || \
         (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8) || \
         (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 8 && __CUDACC_VER_BUILD__ < 90))
-#define ENABLE_BLACKWELL 1
+#define ENABLE_TCG05_FP4 1
 #endif
-#if ENABLE_BLACKWELL
+#if ENABLE_TCG05_FP4
 #include <cuda_fp4.h>
 #endif
 #include <stdio.h>
