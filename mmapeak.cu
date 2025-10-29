@@ -1,11 +1,34 @@
-// nvcc -O2 mmapeak.cu -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 -o mmapeak
-// Note: Added sm_100 target for Blackwell. Removed 110f/120f as 100 is the correct arch.
+// mmapeak.cu
+//
+// Build:
+//   nvcc -O2 mmapeak.cu \
+//     -gencode arch=compute_80,code=sm_80 \
+//     -gencode arch=compute_86,code=sm_86 \
+//     -gencode arch=compute_89,code=sm_89 \
+//     -gencode arch=compute_90,code=sm_90 \
+//     -gencode arch=compute_100,code=sm_100 \
+//     -o mmapeak
+//
+// Notes:
+// - Added sm_100 target for Blackwell.
+// - Removed WMMA m16n8k32 (k32) shapes that are not supported by WMMA and
+//   were causing “incomplete type” compile errors. WMMA supports
+//   m16n16k16, m32n8k16, m8n32k16 (k=16).
+// - Hopper/Ada FP8 k32 kernels use inline PTX (not the WMMA C++ API).
+// - Blackwell k64 kernels use inline PTX. Headers for FP4/FP8 are included
+//   only when available on the targeted arch.
 
 #include <cuda.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
 #include <mma.h>
-#if __CUDA_ARCH__ >= 890
+#include <cuda_bf16.h>
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
 #include <cuda_fp8.h>
 #endif
+
 // Blackwell / tcgen05 FP4/FP6 MMA are available on SM100+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 #define ENABLE_BLACKWELL 1
@@ -13,19 +36,20 @@
 #if ENABLE_BLACKWELL
 #include <cuda_fp4.h>
 #endif
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
 
 using namespace nvcuda::wmma;
 
 #define N_LOOP_INTERNAL 8192
-#define N_LOOP_CALIB 128
+#define N_LOOP_CALIB    128
 #define DEFAULT_TARGET_TIME 3.0f
 
+// ---------------------------------------------------------------------
+// Generic WMMA micro-kernel for valid k16 WMMA shapes
+// ---------------------------------------------------------------------
 template <typename InputType, typename OutputType, unsigned M, unsigned N, unsigned K>
 __device__ void mma_(OutputType *data)
 {
+    // Valid WMMA shapes are (M,N,K) in {(16,16,16), (32,8,16), (8,32,16)} for f16/bf16/tf32.
     fragment<accumulator, M, N, K, OutputType> d;
     fragment<matrix_a, M, N, K, InputType, row_major> a;
     fragment<matrix_b, M, N, K, InputType, col_major> b;
@@ -41,17 +65,17 @@ __device__ void mma_(OutputType *data)
     store_matrix_sync(ptr, d, N, mem_row_major);
 }
 
+// ---------------------------------------------------------------------
+// s4 (int4) custom PTX helper for Ampere int4 m8n8k32 (original)
+// ---------------------------------------------------------------------
 inline __device__ void mma_s4_(
     fragment<accumulator, 8, 8, 32, int> &d,
-    const fragment<matrix_a, 8, 8, 32, experimental::precision::s4, row_major> &
-        a,
-    const fragment<matrix_b, 8, 8, 32, experimental::precision::s4, col_major> &
-        b,
+    const fragment<matrix_a, 8, 8, 32, experimental::precision::s4, row_major> &a,
+    const fragment<matrix_b, 8, 8, 32, experimental::precision::s4, col_major> &b,
     const fragment<accumulator, 8, 8, 32, int> &c)
 {
     asm volatile(
-        "mma.sync.aligned.row.col.m8n8k32.s32.s4.s4.s32 {%0, %1}, {%2}, {%3}, "
-        "{%4, %5};\n"
+        "mma.sync.aligned.row.col.m8n8k32.s32.s4.s4.s32 {%0, %1}, {%2}, {%3}, {%4, %5};\n"
         : "=r"(d.x[0]), "=r"(d.x[1])
         : "r"(a.x[0]), "r"(b.x[0]), "r"(c.x[0]), "r"(c.x[1]));
 }
@@ -81,14 +105,10 @@ __device__ void mma_s4_(OutputType *data)
 __device__ void mma_mxf4mxf4f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[4] = {0}; // k64 for mxf4 fits in 4 registers
-    uint32_t b[2] = {0}; // k64 for mxf4 fits in 2 registers
-    uint32_t sa = 0;
-    uint32_t sb = 0;
-    static constexpr uint16_t bid_a = 0;
-    static constexpr uint16_t tid_a = 0;
-    static constexpr uint16_t bid_b = 0;
-    static constexpr uint16_t tid_b = 0;
+    uint32_t a[4] = {0}; // k64 for mxf4 fits in 4 regs
+    uint32_t b[2] = {0}; // k64 for mxf4 fits in 2 regs
+    uint32_t sa = 0, sb = 0;
+    static constexpr uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
@@ -104,10 +124,8 @@ __device__ void mma_mxf4mxf4f32_16_8_64_(float *data)
               "r"(sb), "h"(bid_b), "h"(tid_b));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 __device__ void mma_nvf4nvf4f32_16_8_64_(float *data)
@@ -115,12 +133,8 @@ __device__ void mma_nvf4nvf4f32_16_8_64_(float *data)
     uint32_t d[4] = {0};
     uint32_t a[4] = {0};
     uint32_t b[2] = {0};
-    uint32_t sa = 0;
-    uint32_t sb = 0;
-    static constexpr uint16_t bid_a = 0;
-    static constexpr uint16_t tid_a = 0;
-    static constexpr uint16_t bid_b = 0;
-    static constexpr uint16_t tid_b = 0;
+    uint32_t sa = 0, sb = 0;
+    static constexpr uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
@@ -136,10 +150,8 @@ __device__ void mma_nvf4nvf4f32_16_8_64_(float *data)
               "r"(sb), "h"(bid_b), "h"(tid_b));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 // --- CORRECTED FP4/FP6/FP8 KERNELS (k64) ---
@@ -151,93 +163,83 @@ __device__ void mma_f4f4f16_16_8_64_(half *data)
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f16.e2m1.e2m1.f16 {%0, %1}, {%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, "
-            "{%14, %15};\n"
+            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f16.e2m1.e2m1.f16 {%0, %1}, "
+            "{%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, {%14, %15};\n"
             : "=r"(d[0]), "=r"(d[1])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
 }
 
 __device__ void mma_f4f4f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP4
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP4
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, "
-            "{%16, %17, %18, %19};\n"
+            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, {%16, %17, %18, %19};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 __device__ void mma_f6f6f16_16_8_64_(half *data)
 {
     uint32_t d[2] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP6
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP6
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f16.e3m2.e3m2.f16 {%0, %1}, {%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, "
-            "{%14, %15};\n"
+            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f16.e3m2.e3m2.f16 {%0, %1}, "
+            "{%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, {%14, %15};\n"
             : "=r"(d[0]), "=r"(d[1])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
 }
 
 __device__ void mma_f6f6f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP6
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP6
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f32.e3m2.e3m2.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, "
-            "{%16, %17, %18, %19};\n"
+            "mma.sync.aligned.m16n8k64.row.col.kind::f8f6f4.f32.e3m2.e3m2.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, {%16, %17, %18, %19};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 __device__ void mma_mxf6mxf6f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for MXFP6
-    uint32_t b[4] = {0}; // k64 needs 4 regs for MXFP6
-    uint32_t sa = 0;
-    uint32_t sb = 0;
-    static constexpr uint16_t bid_a = 0;
-    static constexpr uint16_t tid_a = 0;
-    static constexpr uint16_t bid_b = 0;
-    static constexpr uint16_t tid_b = 0;
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
+    uint32_t sa = 0, sb = 0;
+    static constexpr uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
@@ -253,23 +255,17 @@ __device__ void mma_mxf6mxf6f32_16_8_64_(float *data)
               "r"(sb), "h"(bid_b), "h"(tid_b));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 __device__ void mma_mxf8mxf8f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for MXFP8
-    uint32_t b[4] = {0}; // k64 needs 4 regs for MXFP8
-    uint32_t sa = 0;
-    uint32_t sb = 0;
-    static constexpr uint16_t bid_a = 0;
-    static constexpr uint16_t tid_a = 0;
-    static constexpr uint16_t bid_b = 0;
-    static constexpr uint16_t tid_b = 0;
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
+    uint32_t sa = 0, sb = 0;
+    static constexpr uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
@@ -285,127 +281,116 @@ __device__ void mma_mxf8mxf8f32_16_8_64_(float *data)
               "r"(sb), "h"(bid_b), "h"(tid_b));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 // --- NEW Blackwell FP8 k64 Kernels ---
 __device__ void mma_f8f8f16_16_8_64_(half *data)
 {
     uint32_t d[2] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP8
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP8
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.f16.e4m3.e4m3.f16 {%0, %1}, {%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, "
-            "{%14, %15};\n"
+            "mma.sync.aligned.m16n8k64.row.col.f16.e4m3.e4m3.f16 {%0, %1}, "
+            "{%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, {%14, %15};\n"
             : "=r"(d[0]), "=r"(d[1])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
 }
 
 __device__ void mma_f8f8f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP8
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP8
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, "
-            "{%16, %17, %18, %19};\n"
+            "mma.sync.aligned.m16n8k64.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, {%16, %17, %18, %19};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 // --- NEW Blackwell FP16/BF16 k64 Kernels ---
 __device__ void mma_f16f16f16_16_8_64_(half *data)
 {
     uint32_t d[2] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP16
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP16
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, "
-            "{%14, %15};\n"
+            "mma.sync.aligned.m16n8k64.row.col.f16.f16.f16.f16 {%0, %1}, "
+            "{%2, %3, %4, %5, %6, %7, %8, %9}, {%10, %11, %12, %13}, {%14, %15};\n"
             : "=r"(d[0]), "=r"(d[1])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
 }
 
 __device__ void mma_f16f16f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for FP16
-    uint32_t b[4] = {0}; // k64 needs 4 regs for FP16
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, "
-            "{%16, %17, %18, %19};\n"
+            "mma.sync.aligned.m16n8k64.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, {%16, %17, %18, %19};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 
 __device__ void mma_bf16bf16f32_16_8_64_(float *data)
 {
     uint32_t d[4] = {0};
-    uint32_t a[8] = {0}; // k64 needs 8 regs for BF16
-    uint32_t b[4] = {0}; // k64 needs 4 regs for BF16
+    uint32_t a[8] = {0};
+    uint32_t b[4] = {0};
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k64.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, "
-            "{%16, %17, %18, %19};\n"
+            "mma.sync.aligned.m16n8k64.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, {%16, %17, %18, %19};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
               "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
-
 #endif // ENABLE_BLACKWELL
 
 // =================================================================
-// HOPPER/ADA (sm_89, sm_90) m16n8k32 Kernels
+// HOPPER/ADA (sm_89, sm_90) m16n8k32 FP8 Kernels via PTX
 // =================================================================
-#if __CUDA_ARCH__ >= 890
-// --- FP8 k32 Kernels (for Hopper/Ada) ---
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+// FP8 e4m3 -> f16
 __device__ void mma_f8f8f16_16_8_32_(half *data)
 {
     uint32_t d[2] = {0};
@@ -414,18 +399,18 @@ __device__ void mma_f8f8f16_16_8_32_(half *data)
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, "
-            "{%8, %9};\n"
+            "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0, %1}, "
+            "{%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n"
             : "=r"(d[0]), "=r"(d[1])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
               "r"(b[0]), "r"(b[1]),
               "r"(d[0]), "r"(d[1]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
 }
 
+// FP8 e4m3 -> f32
 __device__ void mma_f8f8f32_16_8_32_(float *data)
 {
     uint32_t d[4] = {0};
@@ -434,18 +419,16 @@ __device__ void mma_f8f8f32_16_8_32_(float *data)
     for (unsigned k = 0; k < N_LOOP_INTERNAL; k++)
     {
         asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-            "{%10, %11, %12, %13};\n"
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
               "r"(b[0]), "r"(b[1]),
               "r"(d[0]), "r"(d[1]), "r"(d[2]), "r"(d[3]));
         __syncwarp();
     }
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data), "r"(d[0]), "r"(d[1]));
-    asm volatile(
-        "wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data),      "r"(d[0]), "r"(d[1]));
+    asm volatile("wmma.store.d.sync.aligned.row.m8n8k32.global.s32 [%0], {%1, %2};\n" ::"l"(data + 64), "r"(d[2]), "r"(d[3]));
 }
 #endif // __CUDA_ARCH__ >= 890
 
@@ -453,6 +436,7 @@ __device__ void mma_f8f8f32_16_8_32_(float *data)
 // Kernel Wrappers
 // =================================================================
 
+// s4 int4
 __global__ void mma_s4s4s32_8_8_32(void *data, int *rc)
 {
     mma_s4_<experimental::precision::s4, int, 8, 8, 32>((int *)data);
@@ -461,71 +445,19 @@ __global__ void mma_s4s4s32_8_8_32(void *data, int *rc)
 
 // --- Blackwell k64 Wrappers ---
 #if ENABLE_BLACKWELL
-__global__ void mma_mxf4mxf4f32_16_8_64(void *data, int *rc)
-{
-    mma_mxf4mxf4f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_nvf4nvf4f32_16_8_64(void *data, int *rc)
-{
-    mma_nvf4nvf4f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_f4f4f16_16_8_64(void *data, int *rc)
-{
-    mma_f4f4f16_16_8_64_((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f4f4f32_16_8_64(void *data, int *rc)
-{
-    mma_f4f4f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_f6f6f16_16_8_64(void *data, int *rc)
-{
-    mma_f6f6f16_16_8_64_((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f6f6f32_16_8_64(void *data, int *rc)
-{
-    mma_f6f6f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_mxf6mxf6f32_16_8_64(void *data, int *rc)
-{
-    mma_mxf6mxf6f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_mxf8mxf8f32_16_8_64(void *data, int *rc)
-{
-    mma_mxf8mxf8f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_f8f8f16_16_8_64(void *data, int *rc)
-{
-    mma_f8f8f16_16_8_64_((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f8f8f32_16_8_64(void *data, int *rc)
-{
-    mma_f8f8f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f16_16_8_64(void *data, int *rc)
-{
-    mma_f16f16f16_16_8_64_((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f32_16_8_64(void *data, int *rc)
-{
-    mma_f16f16f32_16_8_64_((float *)data);
-    *rc = 0;
-}
-__global__ void mma_bf16bf16f32_16_8_64(void *data, int *rc)
-{
-    mma_bf16bf16f32_16_8_64_((float *)data);
-    *rc = 0;
-}
+__global__ void mma_mxf4mxf4f32_16_8_64(void *data, int *rc) { mma_mxf4mxf4f32_16_8_64_((float *)data); *rc = 0; }
+__global__ void mma_nvf4nvf4f32_16_8_64(void *data, int *rc) { mma_nvf4nvf4f32_16_8_64_((float *)data); *rc = 0; }
+__global__ void mma_f4f4f16_16_8_64(void *data, int *rc)      { mma_f4f4f16_16_8_64_((half *)data);     *rc = 0; }
+__global__ void mma_f4f4f32_16_8_64(void *data, int *rc)      { mma_f4f4f32_16_8_64_((float *)data);    *rc = 0; }
+__global__ void mma_f6f6f16_16_8_64(void *data, int *rc)      { mma_f6f6f16_16_8_64_((half *)data);     *rc = 0; }
+__global__ void mma_f6f6f32_16_8_64(void *data, int *rc)      { mma_f6f6f32_16_8_64_((float *)data);    *rc = 0; }
+__global__ void mma_mxf6mxf6f32_16_8_64(void *data, int *rc)  { mma_mxf6mxf6f32_16_8_64_((float *)data);*rc = 0; }
+__global__ void mma_mxf8mxf8f32_16_8_64(void *data, int *rc)  { mma_mxf8mxf8f32_16_8_64_((float *)data);*rc = 0; }
+__global__ void mma_f8f8f16_16_8_64(void *data, int *rc)      { mma_f8f8f16_16_8_64_((half *)data);     *rc = 0; }
+__global__ void mma_f8f8f32_16_8_64(void *data, int *rc)      { mma_f8f8f32_16_8_64_((float *)data);    *rc = 0; }
+__global__ void mma_f16f16f16_16_8_64(void *data, int *rc)    { mma_f16f16f16_16_8_64_((half *)data);   *rc = 0; }
+__global__ void mma_f16f16f32_16_8_64(void *data, int *rc)    { mma_f16f16f32_16_8_64_((float *)data);  *rc = 0; }
+__global__ void mma_bf16bf16f32_16_8_64(void *data, int *rc)  { mma_bf16bf16f32_16_8_64_((float *)data);*rc = 0; }
 #else
 // Stubs for non-Blackwell
 __global__ void mma_mxf4mxf4f32_16_8_64(void *data, int *rc) { *rc = 1; }
@@ -543,21 +475,22 @@ __global__ void mma_f16f16f32_16_8_64(void *data, int *rc) { *rc = 1; }
 __global__ void mma_bf16bf16f32_16_8_64(void *data, int *rc) { *rc = 1; }
 #endif
 
-// --- Hopper/Ada k32 Wrappers ---
-#if __CUDA_ARCH__ >= 890
+// --- Hopper/Ada FP8 k32 Wrappers (PTX) ---
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
 __global__ void mma_f8f8f16_16_8_32(void *data, int *rc)
 {
-#if __CUDA_ARCH__ >= 1000 // Don't run k32 if k64 is available
-    *rc = 1;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    *rc = 1; // Prefer k64 if available
 #else
     mma_f8f8f16_16_8_32_((half *)data);
     *rc = 0;
 #endif
 }
+
 __global__ void mma_f8f8f32_16_8_32(void *data, int *rc)
 {
-#if __CUDA_ARCH__ >= 1000
-    *rc = 1;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    *rc = 1; // Prefer k64 if available
 #else
     mma_f8f8f32_16_8_32_((float *)data);
     *rc = 0;
@@ -569,99 +502,27 @@ __global__ void mma_f8f8f16_16_8_32(void *data, int *rc) { *rc = 1; }
 __global__ void mma_f8f8f32_16_8_32(void *data, int *rc) { *rc = 1; }
 #endif
 
-#if __CUDA_ARCH__ >= 900 // Hopper+ for BF16 k32, FP16 k32
-__global__ void mma_f16f16f16_16_8_32(void *data, int *rc)
-{
-#if __CUDA_ARCH__ >= 1000
-    *rc = 1; // Don't run k32 if k64 is available
-#else
-    mma_<half, half, 16, 8, 32>((half *)data);
-    *rc = 0;
-#endif
-}
-__global__ void mma_f16f16f32_16_8_32(void *data, int *rc)
-{
-#if __CUDA_ARCH__ >= 1000
-    *rc = 1;
-#else
-    mma_<half, float, 16, 8, 32>((float *)data);
-    *rc = 0;
-#endif
-}
-__global__ void mma_bf16bf16f32_16_8_32(void *data, int *rc)
-{
-#if __CUDA_ARCH__ >= 1000
-    *rc = 1;
-#else
-    mma_<__nv_bfloat16, float, 16, 8, 32>((float *)data);
-    *rc = 0;
-#endif
-}
-#else
-// Stubs for pre-Hopper
-__global__ void mma_f16f16f16_16_8_32(void *data, int *rc) { *rc = 1; }
-__global__ void mma_f16f16f32_16_8_32(void *data, int *rc) { *rc = 1; }
-__global__ void mma_bf16bf16f32_16_8_32(void *data, int *rc) { *rc = 1; }
-#endif
+// --- Ampere/Generic k16 WMMA Wrappers (VALID WMMA shapes only) ---
+__global__ void mma_s8s8s32_16_16_16(void *data, int *rc) { mma_<signed char, int, 16, 16, 16>((int *)data); *rc = 0; }
+__global__ void mma_s8s8s32_32_8_16(void *data, int *rc)  { mma_<signed char, int, 32, 8, 16>((int *)data);  *rc = 0; }
+__global__ void mma_f16f16f16_16_16_16(void *data, int *rc){ mma_<half, half, 16, 16, 16>((half *)data);      *rc = 0; }
+__global__ void mma_f16f16f16_32_8_16(void *data, int *rc) { mma_<half, half, 32, 8, 16>((half *)data);       *rc = 0; }
+__global__ void mma_f16f16f32_16_16_16(void *data, int *rc){ mma_<half, float, 16, 16, 16>((float *)data);    *rc = 0; }
+__global__ void mma_f16f16f32_32_8_16(void *data, int *rc) { mma_<half, float, 32, 8, 16>((float *)data);     *rc = 0; }
 
-// --- Ampere k16 Wrappers (Original) ---
-__global__ void mma_s8s8s32_16_16_16(void *data, int *rc)
-{
-    mma_<signed char, int, 16, 16, 16>((int *)data);
-    *rc = 0;
-}
-__global__ void mma_s8s8s32_32_8_16(void *data, int *rc)
-{
-    mma_<signed char, int, 32, 8, 16>((int *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f16_16_16_16(void *data, int *rc)
-{
-    mma_<half, half, 16, 16, 16>((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f16_32_8_16(void *data, int *rc)
-{
-    mma_<half, half, 32, 8, 16>((half *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f32_16_16_16(void *data, int *rc)
-{
-    mma_<half, float, 16, 16, 16>((float *)data);
-    *rc = 0;
-}
-__global__ void mma_f16f16f32_32_8_16(void *data, int *rc)
-{
-    mma_<half, float, 32, 8, 16>((float *)data);
-    *rc = 0;
-}
-
-#if __CUDA_ARCH__ >= 800
-__global__ void mma_bf16bf16f32_16_16_16(void *data, int *rc)
-{
-    mma_<__nv_bfloat16, float, 16, 16, 16>((float *)data);
-    *rc = 0;
-}
-__global__ void mma_bf16bf16f32_32_8_16(void *data, int *rc)
-{
-    mma_<__nv_bfloat16, float, 32, 8, 16>((float *)data);
-    *rc = 0;
-}
-__global__ void mma_tf32tf32f32_16_16_8(void *data, int *rc)
-{
-    mma_<precision::tf32, float, 16, 16, 8>((float *)data);
-    *rc = 0;
-}
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+__global__ void mma_bf16bf16f32_16_16_16(void *data, int *rc) { mma_<__nv_bfloat16, float, 16, 16, 16>((float *)data); *rc = 0; }
+__global__ void mma_bf16bf16f32_32_8_16(void *data, int *rc)  { mma_<__nv_bfloat16, float, 32, 8, 16>((float *)data);  *rc = 0; }
+__global__ void mma_tf32tf32f32_16_16_8(void *data, int *rc)  { mma_<precision::tf32, float, 16, 16, 8>((float *)data);*rc = 0; }
 #else
 __global__ void mma_bf16bf16f32_16_16_16(void *data, int *rc) { *rc = 1; }
-__global__ void mma_bf16bf16f32_32_8_16(void *data, int *rc) { *rc = 1; }
-__global__ void mma_tf32tf32f32_16_16_8(void *data, int *rc) { *rc = 1; }
+__global__ void mma_bf16bf16f32_32_8_16(void *data, int *rc)  { *rc = 1; }
+__global__ void mma_tf32tf32f32_16_16_8(void *data, int *rc)  { *rc = 1; }
 #endif
 
 // =================================================================
-// Host/Main function
+// Host helpers
 // =================================================================
-
 #define cudaCheckError() cudaCheckError_(__FILE__, __LINE__)
 inline void cudaCheckError_(const char *file, int line)
 {
@@ -681,6 +542,7 @@ void run(void *kernel, float targetTime, const char *kernelName)
     const int warp_size = 32;
     dim3 grid(num_tb);
     dim3 block(warp_size, num_warps_per_tb);
+
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     cudaCheckError();
@@ -688,6 +550,7 @@ void run(void *kernel, float targetTime, const char *kernelName)
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaCheckError();
+
     void *data = nullptr;
     size_t nbytes = num_warps_per_tb * M * N * sizeof(OutputType);
     cudaMalloc(&data, nbytes);
@@ -695,6 +558,7 @@ void run(void *kernel, float targetTime, const char *kernelName)
 
     int *d_rc;
     cudaMalloc(&d_rc, sizeof(int));
+
     ((void (*)(void *, int *))kernel)<<<grid, block, 0, stream>>>(data, d_rc);
     int h_rc = 0;
     cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost);
@@ -705,13 +569,10 @@ void run(void *kernel, float targetTime, const char *kernelName)
     else
     {
         int n_loop = N_LOOP_CALIB;
-        cudaCheckError();
+
         cudaEventRecord(start, stream);
         for (int i = 0; i < n_loop; i++)
-        {
             ((void (*)(void *, int *))kernel)<<<grid, block, 0, stream>>>(data, d_rc);
-        }
-        cudaCheckError();
         cudaEventRecord(stop, stream);
         cudaEventSynchronize(stop);
         float ms;
@@ -722,18 +583,16 @@ void run(void *kernel, float targetTime, const char *kernelName)
 
         cudaEventRecord(start, stream);
         for (int i = 0; i < n_loop; i++)
-        {
             ((void (*)(void *, int *))kernel)<<<grid, block, 0, stream>>>(data, d_rc);
-        }
-        cudaCheckError();
         cudaEventRecord(stop, stream);
         cudaEventSynchronize(stop);
         cudaStreamDestroy(stream);
-        cudaCheckError();
         cudaEventElapsedTime(&ms, start, stop);
+
         float ops = 1.0f * num_tb * num_warps_per_tb * n_loop * N_LOOP_INTERNAL * M * N * K * 2;
         printf("%-30s: %.1f ms %.1f T(fl)ops\n", kernelName, ms, ops / ms / 1.0e9f);
     }
+
     cudaFree(d_rc);
     cudaFree(data);
     cudaCheckError();
@@ -742,6 +601,9 @@ void run(void *kernel, float targetTime, const char *kernelName)
 #define RUN_BENCHMARK(Type, M, N, K, Kernel, Name) \
     run<Type, M, N, K>((void*)Kernel, targetTime, Name)
 
+// =================================================================
+// CLI + main
+// =================================================================
 void print_usage()
 {
     printf("Usage: mmapeak [options]\n");
@@ -754,7 +616,6 @@ int main(int argc, char **argv)
 {
     float targetTime = DEFAULT_TARGET_TIME;
 
-    // Parse command line arguments
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
@@ -780,7 +641,7 @@ int main(int argc, char **argv)
         }
     }
 
-    int deviceCount;
+    int deviceCount = 0;
     cudaGetDeviceCount(&deviceCount);
     cudaCheckError();
     if (deviceCount == 0)
@@ -788,10 +649,10 @@ int main(int argc, char **argv)
         printf("No CUDA devices found\n");
         return 1;
     }
+
     for (int i = 0; i < deviceCount; i++)
     {
         printf("----------------------------------------\n");
-
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);
         cudaCheckError();
@@ -808,36 +669,33 @@ int main(int argc, char **argv)
         printf("--- Blackwell (sm_100+) k64 shapes ---\n");
         RUN_BENCHMARK(float, 16, 8, 64, mma_mxf4mxf4f32_16_8_64, "mma_mxf4mxf4f32_16_8_64");
         RUN_BENCHMARK(float, 16, 8, 64, mma_nvf4nvf4f32_16_8_64, "mma_nvf4nvf4f32_16_8_64");
-        RUN_BENCHMARK(half,  16, 8, 64, mma_f4f4f16_16_8_64, "mma_f4f4f16_16_8_64");
-        RUN_BENCHMARK(float, 16, 8, 64, mma_f4f4f32_16_8_64, "mma_f4f4f32_16_8_64");
-        RUN_BENCHMARK(half,  16, 8, 64, mma_f6f6f16_16_8_64, "mma_f6f6f16_16_8_64");
-        RUN_BENCHMARK(float, 16, 8, 64, mma_f6f6f32_16_8_64, "mma_f6f6f32_16_8_64");
+        RUN_BENCHMARK(half,  16, 8, 64, mma_f4f4f16_16_8_64,     "mma_f4f4f16_16_8_64");
+        RUN_BENCHMARK(float, 16, 8, 64, mma_f4f4f32_16_8_64,     "mma_f4f4f32_16_8_64");
+        RUN_BENCHMARK(half,  16, 8, 64, mma_f6f6f16_16_8_64,     "mma_f6f6f16_16_8_64");
+        RUN_BENCHMARK(float, 16, 8, 64, mma_f6f6f32_16_8_64,     "mma_f6f6f32_16_8_64");
         RUN_BENCHMARK(float, 16, 8, 64, mma_mxf6mxf6f32_16_8_64, "mma_mxf6mxf6f32_16_8_64");
         RUN_BENCHMARK(float, 16, 8, 64, mma_mxf8mxf8f32_16_8_64, "mma_mxf8mxf8f32_16_8_64");
-        RUN_BENCHMARK(half,  16, 8, 64, mma_f8f8f16_16_8_64, "mma_f8f8f16_16_8_64");
-        RUN_BENCHMARK(float, 16, 8, 64, mma_f8f8f32_16_8_64, "mma_f8f8f32_16_8_64");
-        RUN_BENCHMARK(half,  16, 8, 64, mma_f16f16f16_16_8_64, "mma_f16f16f16_16_8_64");
-        RUN_BENCHMARK(float, 16, 8, 64, mma_f16f16f32_16_8_64, "mma_f16f16f32_16_8_64");
+        RUN_BENCHMARK(half,  16, 8, 64, mma_f8f8f16_16_8_64,     "mma_f8f8f16_16_8_64");
+        RUN_BENCHMARK(float, 16, 8, 64, mma_f8f8f32_16_8_64,     "mma_f8f8f32_16_8_64");
+        RUN_BENCHMARK(half,  16, 8, 64, mma_f16f16f16_16_8_64,   "mma_f16f16f16_16_8_64");
+        RUN_BENCHMARK(float, 16, 8, 64, mma_f16f16f32_16_8_64,   "mma_f16f16f32_16_8_64");
         RUN_BENCHMARK(float, 16, 8, 64, mma_bf16bf16f32_16_8_64, "mma_bf16bf16f32_16_8_64");
 
-        printf("--- Hopper/Ada (sm_89/90) k32 shapes ---\n");
-        RUN_BENCHMARK(half,  16, 8, 32, mma_f8f8f16_16_8_32, "mma_f8f8f16_16_8_32");
-        RUN_BENCHMARK(float, 16, 8, 32, mma_f8f8f32_16_8_32, "mma_f8f8f32_16_8_32");
-        RUN_BENCHMARK(half,  16, 8, 32, mma_f16f16f16_16_8_32, "mma_f16f16f16_16_8_32");
-        RUN_BENCHMARK(float, 16, 8, 32, mma_f16f16f32_16_8_32, "mma_f16f16f32_16_8_32");
-        RUN_BENCHMARK(float, 16, 8, 32, mma_bf16bf16f32_16_8_32, "mma_bf16bf16f32_16_8_32");
+        printf("--- Hopper/Ada (sm_89/90) FP8 k32 shapes (PTX) ---\n");
+        RUN_BENCHMARK(half,  16, 8, 32, mma_f8f8f16_16_8_32,     "mma_f8f8f16_16_8_32");
+        RUN_BENCHMARK(float, 16, 8, 32, mma_f8f8f32_16_8_32,     "mma_f8f8f32_16_8_32");
 
-        printf("--- Ampere (sm_80+) k16/k8 shapes ---\n");
-        RUN_BENCHMARK(int,    8,  8, 32, mma_s4s4s32_8_8_32, "mma_s4s4s32_8_8_32");
-        RUN_BENCHMARK(int,   16, 16, 16, mma_s8s8s32_16_16_16, "mma_s8s8s32_16_16_16");
-        RUN_BENCHMARK(int,   32,  8, 16, mma_s8s8s32_32_8_16, "mma_s8s8s32_32_8_16");
+        printf("--- Ampere+ (sm_80+) WMMA k16/k8 shapes ---\n");
+        RUN_BENCHMARK(int,   8,  8, 32, mma_s4s4s32_8_8_32,      "mma_s4s4s32_8_8_32");
+        RUN_BENCHMARK(int,   16, 16, 16, mma_s8s8s32_16_16_16,   "mma_s8s8s32_16_16_16");
+        RUN_BENCHMARK(int,   32, 8,  16, mma_s8s8s32_32_8_16,    "mma_s8s8s32_32_8_16");
         RUN_BENCHMARK(half,  16, 16, 16, mma_f16f16f16_16_16_16, "mma_f16f16f16_16_16_16");
-        RUN_BENCHMARK(half,  32,  8, 16, mma_f16f16f16_32_8_16, "mma_f16f16f16_32_8_16");
+        RUN_BENCHMARK(half,  32, 8,  16, mma_f16f16f16_32_8_16,  "mma_f16f16f16_32_8_16");
         RUN_BENCHMARK(float, 16, 16, 16, mma_f16f16f32_16_16_16, "mma_f16f16f32_16_16_16");
-        RUN_BENCHMARK(float, 32,  8, 16, mma_f16f16f32_32_8_16, "mma_f16f16f32_32_8_16");
-        RUN_BENCHMARK(float, 16, 16, 16, mma_bf16bf16f32_16_16_16, "mma_bf16bf16f32_16_16_16");
-        RUN_BENCHMARK(float, 32,  8, 16, mma_bf16bf16f32_32_8_16, "mma_bf16bf16f32_32_8_16");
-        RUN_BENCHMARK(float, 16, 16,  8, mma_tf32tf32f32_16_16_8, "mma_tf32tf32f32_16_16_8");
+        RUN_BENCHMARK(float, 32, 8,  16, mma_f16f16f32_32_8_16,  "mma_f16f16f32_32_8_16");
+        RUN_BENCHMARK(float, 16, 16, 8,  mma_tf32tf32f32_16_16_8,"mma_tf32tf32f32_16_16_8");
+        RUN_BENCHMARK(float, 16, 16, 16, mma_bf16bf16f32_16_16_16,"mma_bf16bf16f32_16_16_16");
+        RUN_BENCHMARK(float, 32, 8,  16, mma_bf16bf16f32_32_8_16,"mma_bf16bf16f32_32_8_16");
     }
     return 0;
 }
